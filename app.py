@@ -1,6 +1,7 @@
 import os
 import html
 import json
+import re
 from datetime import date, timedelta
 from typing import List, Dict, Any
 import threading
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from openpyxl import load_workbook
 
-EXCEL_FILE = "AIRPORT_ZONE.xlsx"
+EXCEL_FILE = os.environ.get("EXCEL_FILE", "AIRPORT_ZONE_CORD.xlsx" if os.path.exists("AIRPORT_ZONE_CORD.xlsx") else "AIRPORT_ZONE.xlsx")
 SHEET_NAME = "AIRPORT_ZONE"
 HUB = "DXB"
 HUB_ZONE = "Z09"
@@ -24,7 +25,7 @@ HIT_COUNTER_FILE = os.environ.get("HIT_COUNTER_FILE", "hit_counter.txt")
 HIT_LOCK = threading.Lock()
 
 
-AIRPORT_COORDS = {
+DEFAULT_AIRPORT_COORDS = {
     "DXB": [25.2532, 55.3657],
     "JFK": [40.6413, -73.7781],
     "LHR": [51.4700, -0.4543],
@@ -39,6 +40,10 @@ AIRPORT_COORDS = {
     "DEL": [28.5562, 77.1000],
     "MAA": [12.9941, 80.1709],
 }
+
+# Airport coordinates are loaded from Excel during startup.
+# DEFAULT_AIRPORT_COORDS is only a safe fallback for older Excel files.
+AIRPORT_COORDS: Dict[str, List[float]] = dict(DEFAULT_AIRPORT_COORDS)
 
 
 def get_hit_count() -> int:
@@ -61,6 +66,45 @@ def increment_hit_count() -> int:
 
 def norm(v) -> str:
     return str(v or "").strip().upper()
+
+
+def parse_airport_coords(row, headers: List[str]) -> List[float] | None:
+    """Read airport coordinates from Excel.
+
+    Supported formats:
+      AIRPORT_COORDS = [25.2532, 55.3657]
+      AIRPORT_COORDS = 25.2532, 55.3657
+      LATITUDE/LONGITUDE or LAT/LON columns
+    """
+    coord_columns = ["AIRPORT_COORDS", "AIRPORT_COORD", "COORDINATES", "COORDS", "LAT_LONG", "LATLON"]
+
+    for col_name in coord_columns:
+        if col_name in headers:
+            raw = row[headers.index(col_name)]
+            if raw is None:
+                continue
+            nums = re.findall(r"-?\d+(?:\.\d+)?", str(raw))
+            if len(nums) >= 2:
+                lat = float(nums[0])
+                lon = float(nums[1])
+                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                    return [lat, lon]
+
+    lat_columns = ["LATITUDE", "LAT"]
+    lon_columns = ["LONGITUDE", "LON", "LONG", "LNG"]
+    lat_idx = next((headers.index(c) for c in lat_columns if c in headers), None)
+    lon_idx = next((headers.index(c) for c in lon_columns if c in headers), None)
+
+    if lat_idx is not None and lon_idx is not None:
+        try:
+            lat = float(row[lat_idx])
+            lon = float(row[lon_idx])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return [lat, lon]
+        except Exception:
+            return None
+
+    return None
 
 
 def zone_num(z: str) -> int:
@@ -89,10 +133,11 @@ def sector_pair(s: Dict[str, Any]) -> str:
 
 
 def load_airport_zone():
-    global AIRPORT_ZONE, AIRPORTS, STARTUP_ERROR
+    global AIRPORT_ZONE, AIRPORTS, AIRPORT_COORDS, STARTUP_ERROR
 
     AIRPORT_ZONE = {}
     AIRPORTS = []
+    AIRPORT_COORDS = dict(DEFAULT_AIRPORT_COORDS)
     STARTUP_ERROR = ""
 
     if not os.path.exists(EXCEL_FILE):
@@ -122,6 +167,10 @@ def load_airport_zone():
 
         if airport and zone:
             AIRPORT_ZONE[airport] = zone
+
+            coords = parse_airport_coords(row, headers)
+            if coords:
+                AIRPORT_COORDS[airport] = coords
 
     if HUB not in AIRPORT_ZONE:
         AIRPORT_ZONE[HUB] = HUB_ZONE
@@ -839,6 +888,7 @@ def render_page(rows: List[Dict[str, Any]], results=None, error_message: str = "
         hit_count = get_hit_count()
 
     map_routes_json = json.dumps(build_map_routes(results))
+    airport_coords_json = json.dumps(AIRPORT_COORDS)
 
     startup_html = ""
     if STARTUP_ERROR:
@@ -1159,7 +1209,7 @@ button {{ background:#7a0019; color:white; border:none; padding:11px 18px; borde
 
 <script>
 const MAP_ROUTES = {map_routes_json};
-const AIRPORT_COORDS_JS = {{"DXB": [25.2532, 55.3657], "JFK": [40.6413, -73.7781], "LHR": [51.47, -0.4543], "CDG": [49.0097, 2.5479], "SIN": [1.3644, 103.9915], "MEL": [-37.669, 144.841], "AKL": [-37.0082, 174.785], "SYD": [-33.9399, 151.1753], "BAH": [26.2708, 50.6336], "MCT": [23.5933, 58.2844], "BOM": [19.0896, 72.8656], "DEL": [28.5562, 77.1], "MAA": [12.9941, 80.1709]}};
+const AIRPORT_COORDS_JS = {airport_coords_json};
 let odMap = null;
 let routeLegendControl = null;
 
